@@ -1,0 +1,21 @@
+# Copyright (c) 2026 Niobium Microsystems, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# expected_scores.txt — single source of truth for the toy-dataset score windows,
+# read by harness/run_submission.py. Non-toy tiers derive their rows from the
+# dataset at runtime.
+# Format (pipe-delimited): mode | query | description | expected_min | expected_max
+# (CKKS is approximate → windows allow a small ε around integer scores.)
+# Toy set: "James Smith"=line 1 (soundex J525, 2 matches), "Mildred Schneider"=last,
+# "Jaymz Smyth"≈J525; "Notpresent Zzzzz"/"Robbrt Smyth" absent.
+#
+# mode    | query               | description                 | min      | max
+exact   | James Smith         | exact match (line 1)        | 0.95     | 1.05
+exact   | Mildred Schneider   | exact match (last line)     | 0.95     | 1.05
+exact   | JAMES SMITH         | case-insensitive match      | 0.95     | 1.05
+exact   | Notpresent Zzzzz    | no match (nonsense name)    | -0.01    | 0.01
+exact   | Robbrt Smyth        | no match (typo of in-set)   | -0.01    | 0.01
+soundex | James Smith         | soundex match (2 J525s)     | 1.90     | 2.10
+soundex | Mildred Schneider   | soundex match (1 phonetic)  | 0.95     | 1.05
+soundex | Jaymz Smyth         | phonetic-equiv to J525s     | 1.90     | 2.10
+soundex | Notpresent Zzzzz    | no match                    | -0.01    | 0.01

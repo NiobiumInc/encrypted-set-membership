@@ -1,0 +1,52 @@
+# Build directories
+build/
+cmake-build-*/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled objects
+*.o
+*.a
+*.so
+*.dylib
+
+# Executables
+fhe-string-matcher
+fhe-test-suite
+
+# Downloaded / generated datasets (regenerate via scripts/)
+# NOTE: the small/medium/large_names.txt datasets are intentionally committed:
+# frozen, collision-free snapshots (65,536 / 131,072 / 1,048,576 names) so the
+# larger sizes are deterministic without a fetch.
+# The rest stay ignored (fetched/regenerated on demand).
+datasets/notable_people.txt
+datasets/combined.txt
+
+# Niobium recording caches and generated FHE keys
+membership_search_mode_*/
+fhe_keys_*/
+
+# Profiling / IDE artifacts
+*.profraw
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Niobium transport working dirs, see NIOBIUM_INTEGRATION.md
+io/
+matcher_compute_mode_*/
+global_key_cache/
+niobium-client/build/
+measurements/
+nbcc_fhetch_replay_source_*/
