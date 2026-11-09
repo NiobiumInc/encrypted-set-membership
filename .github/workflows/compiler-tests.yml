@@ -18,23 +18,17 @@
 # The build and the phonetic unit test are plain C++/OpenFHE and safe to show.
 # ===========================================================================
 #
-# ROLLOUT: workflow_dispatch ONLY for now. The gcp-ephemeral runner group may be
-# pinned to this path @refs/heads/main, so the file must land on main before any
-# run can get a runner. After the first dispatched runs have measured memory and
-# time (memlog below), a follow-up PR adds:
-#     pull_request: { branches: [main] }     # fork PRs need approval (public repo)
-#     push:         { branches: [main] }
-# and resizes the runner from those measurements.
+# Fork PRs need approval to run (public repo).
 # Never use pull_request_target with a checkout of the PR head.
 
 name: compiler-tests
 
 on:
-  workflow_dispatch: {}
-  # TEMPORARY — remove before merging. workflow_dispatch only works once this
-  # file is on main, so pushes to this branch run it for pre-merge testing.
+  pull_request:
+    branches: [main]
   push:
-    branches: [ci/gcp-ephemeral-compiler-tests]
+    branches: [main]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -47,12 +41,14 @@ concurrency:
 jobs:
   compiler-tests:
     name: Build, unit tests, E2E replay (self-hosted, GCP)
-    # Size: no measurement for this workload yet. Start where FBS landed
-    # (n2-highmem-16, 128 GB) and resize in the PR that enables pull_request/push,
-    # from the memory log below — the toy tier is one 32K-slot batch, so it should need far less.
+    # Size, measured on n2-highmem-16 (2026-11-09, run 42651925157): peak used
+    # 18.0 GiB in the build (parallel OpenFHE compile), 12.7 GiB in the E2E;
+    # build 6.4 min, E2E 1.7 min. n2-standard-16 keeps the 16 vCPUs (same build
+    # time) with 64 GB, ~3.5x the peak. The memory monitor below reports the
+    # peak per phase on every run: re-check it when the build or tiers change.
     # The "run-<run_id>" label is REQUIRED (run-scoped routing).
-    runs-on: [self-hosted, Linux, X64, gcp-ephemeral, n2-highmem-16, "run-${{ github.run_id }}"]
-    timeout-minutes: 60   # OpenFHE cold build ~15 min + record/replay round trip
+    runs-on: [self-hosted, Linux, X64, gcp-ephemeral, n2-standard-16, "run-${{ github.run_id }}"]
+    timeout-minutes: 30   # measured job ~9 min; a hang must not hold the VM
     env:
       SDK: /mnt/niobium-sdk/sdk   # mounted RO at boot by runner-startup.sh
       PORT: "9443"
