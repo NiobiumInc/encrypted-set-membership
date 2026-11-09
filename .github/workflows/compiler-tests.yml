@@ -1,0 +1,257 @@
+# .github/workflows/compiler-tests.yml
+#
+# Public-repo CI for encrypted-set-membership. Runs on the ephemeral GCP
+# self-hosted runner group (gcp-ephemeral), NOT on Slurm: this repo is public,
+# and slurm-dispatch refuses public repos so the on-prem cluster is never
+# exposed to public-repo PRs. Adapted from
+# NiobiumInc/fetch-by-similarity-submission's compiler-tests.yml; see
+# https://github.com/NiobiumInc/gcp-github-runners (workflow-snippets/README.md)
+# for onboarding + operational details, and NIOBIUM_INTEGRATION.md here for the
+# record/replay integration.
+#
+# ===========================================================================
+# HARD REQUIREMENT: NO nbcc / compiler output in the public Actions log.
+# Public repos => Actions logs AND artifacts are world-readable. The transport
+# server and the E2E run send stdout+stderr to files that never reach the log;
+# this workflow surfaces ONLY PASS/FAIL for them. Do NOT: echo compiler output,
+# `set -x` around it, upload trace/io/key artifacts, or print the SDK version.
+# The build and the phonetic unit test are plain C++/OpenFHE and safe to show.
+# ===========================================================================
+#
+# ROLLOUT: workflow_dispatch ONLY for now. The gcp-ephemeral runner group may be
+# pinned to this path @refs/heads/main, so the file must land on main before any
+# run can get a runner. After the first dispatched runs have measured memory and
+# time (memlog below), a follow-up PR adds:
+#     pull_request: { branches: [main] }     # fork PRs need approval (public repo)
+#     push:         { branches: [main] }
+# and resizes the runner from those measurements.
+# Never use pull_request_target with a checkout of the PR head.
+
+name: compiler-tests
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compiler-tests-${{ github.ref }}
+  # Cancel superseded runs on PRs only: on main every pushed commit must be tested.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  compiler-tests:
+    name: Build, unit tests, E2E replay (self-hosted, GCP)
+    # Size: no measurement for this workload yet. Start where FBS landed
+    # (n2-highmem-16, 128 GB) and resize in the PR that enables pull_request/push,
+    # from the memory log below — the toy tier is one 32K-slot batch, so it should need far less.
+    # The "run-<run_id>" label is REQUIRED (run-scoped routing).
+    runs-on: [self-hosted, Linux, X64, gcp-ephemeral, n2-highmem-16, "run-${{ github.run_id }}"]
+    timeout-minutes: 60   # OpenFHE cold build ~15 min + record/replay round trip
+    env:
+      SDK: /mnt/niobium-sdk/sdk   # mounted RO at boot by runner-startup.sh
+      PORT: "9443"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      # From gcp-github-runners/workflow-snippets: names the OS and the GCE image
+      # this VM booted from (not compiler or SDK output). The VM is deleted after
+      # the job, so this is the only record of which image ran it.
+      - name: Runner identity (OS + image only)
+        run: |
+          . /etc/os-release
+          echo "os:     ${PRETTY_NAME}${VERSION_CODENAME:+ (${VERSION_CODENAME})}"
+          echo "runner: ${RUNNER_NAME}"
+          # Capture before stripping: `curl ... | sed` would mask a failed curl.
+          if img=$(curl -sf -m 5 -H 'Metadata-Flavor: Google' \
+              http://metadata.google.internal/computeMetadata/v1/instance/image); then
+            echo "image:  ${img##*/}"
+          else
+            echo "image:  unknown (no GCE metadata)"
+          fi
+
+      - name: Pin branch SDK (lockstep changes only — .sdk-pin)
+        # Verbatim from gcp-github-runners/workflow-snippets. No-op without a
+        # .sdk-pin file at the repo root; hard-fails on main.
+        run: |
+          set -e
+          PIN="${SDK_PIN_FILE:-.sdk-pin}"
+          [ -f "$PIN" ] || { echo "no $PIN — nightly SDK"; exit 0; }
+          if [ "$GITHUB_REF_NAME" = "main" ]; then
+            echo "::error::.sdk-pin must not exist on main — remove it in the merge"; exit 1
+          fi
+          TAG="$(tr -d ' \r\n' < "$PIN")"
+          case "$TAG" in sdk-branch-*) ;; *) echo "::error::.sdk-pin must name an sdk-branch-* tag"; exit 1;; esac
+          DEST="$RUNNER_TEMP/branch-sdk"; mkdir -p "$DEST"
+          SRC="gs://github-runner-499901-sdk-branches/$TAG"
+          for i in $(seq 1 60); do
+            gcloud storage ls "$SRC/*.tar.*" >/dev/null 2>&1 && break
+            [ "$i" -eq 1 ] && echo "$TAG not in the mirror yet -- waiting up to 30 min for the compiler build"
+            sleep 30
+          done
+          gcloud storage cp "$SRC/*.tar.*" "$DEST/" --quiet \
+            || { echo "::error::$TAG still not in the mirror after 30 min -- check the release-binary-sdk run on the compiler branch, and that the tag is exactly right"; exit 1; }
+          TARBALL="$(find "$DEST" -maxdepth 1 -name '*.tar.*' ! -name '*.sha256' | head -1)"
+          [ -n "$TARBALL" ] || { echo "::error::no tarball in $DEST"; exit 1; }
+          ( cd "$DEST" && sha256sum -c ./*.sha256 ) || { echo "::error::checksum mismatch for $TAG"; exit 1; }
+          tar -xf "$TARBALL" -C "$DEST"
+          SDKDIR="$(dirname "$(find "$DEST" -maxdepth 2 -name bin -type d | head -1)")"
+          [ -x "$SDKDIR/bin/nbcc_fhetch_replay" ] \
+            || { echo "::error::$TAG has no bin/nbcc_fhetch_replay -- not an SDK bundle this job can use"; exit 1; }
+          sudo mount --bind "$SDKDIR" "$SDK"
+          [ "$(stat -c %d:%i "$SDK")" = "$(stat -c %d:%i "$SDKDIR")" ] \
+            || { echo "::error::pin did not take: $SDK is not $SDKDIR after the bind mount"; exit 1; }
+          BUNDLE_VERSION="$(cat "$SDK/VERSION" 2>/dev/null || echo n/a)"
+          grep -q "${TAG##*-}" <<< "$BUNDLE_VERSION" \
+            || echo "::warning::bundle VERSION '$BUNDLE_VERSION' does not mention the tag's sha7 (${TAG##*-})"
+          echo "pinned branch SDK: $TAG over $SDK (bundle VERSION: $BUNDLE_VERSION)"
+
+      - name: Verify SDK is mounted (no version printed)
+        run: |
+          test -x "$SDK/bin/nbcc_fhetch_replay" || { echo "::error::SDK not mounted"; exit 1; }
+
+      - name: Install build tooling
+        # The harness is stdlib-only (requirements.txt), so no Python packages.
+        # build-essential brings libgomp for OpenMP.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build
+
+      - name: Build niobium-client + OpenFHE + matcher stages (release)
+        # Public C++/OpenFHE output — OK to show. build_task.sh is the repo's
+        # only build: client's bundled OpenFHE + libnbfhetch + transport server,
+        # then the five stages and test_phonetic against that OpenFHE.
+        run: scripts/build_task.sh
+
+      - name: Unit tests (phonetic — no FHE, no compiler)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Map the SDK into the layout the transport server expects
+        run: |
+          # The server --execs $NIOBIUM_COMPILER_ROOT/build/nbcc_fhetch_replay;
+          # the SDK ships bin/ + lib/, so bridge with a shim of symlinks.
+          SHIM="$RUNNER_TEMP/nbcc-root"
+          mkdir -p "$SHIM/build"
+          ln -sf "$SDK"/bin/* "$SHIM/build/"
+          ln -sf "$SDK"/lib/* "$SHIM/build/"
+          test -x "$SHIM/build/nbcc_fhetch_replay" || { echo "::error::SDK missing nbcc_fhetch_replay"; exit 1; }
+          echo "NIOBIUM_COMPILER_ROOT=$SHIM" >> "$GITHUB_ENV"
+          echo "NIOBIUM_SPEC_DIR=$SDK/share/niobium/devices" >> "$GITHUB_ENV"
+
+      # matcher_compute_sdk always replays (record on a cache miss, then replay),
+      # so for a non-local --target every run dispatches over the transport:
+      # the server must be up before the harness starts.
+      - name: Start the transport server (background, output suppressed)
+        run: |
+          set +x
+          CLIENT_ROOT="$GITHUB_WORKSPACE/niobium-client"
+          SERVER_BIN="$CLIENT_ROOT/build/src/fhetch_transport/nbcc_fhetch_replay_server"
+          COMPILER_BIN="$NIOBIUM_COMPILER_ROOT/build/nbcc_fhetch_replay"
+          test -x "$SERVER_BIN" || { echo "::error::server binary not built: $SERVER_BIN"; exit 1; }
+
+          ENV_FILE="$CLIENT_ROOT/build/niobium_client.env"
+          [ -f "$ENV_FILE" ] && . "$ENV_FILE"
+          : "${OPENFHE_LIB:=$CLIENT_ROOT/vendor/lib/openfhe/lib}"
+
+          # The server needs the client's OpenFHE on the loader path; the replay
+          # child it spawns needs the SDK's. Give the child its own environment
+          # through a wrapper (same fix as fetch-by-similarity-submission).
+          EXEC_WRAPPER="$RUNNER_TEMP/nbcc_fhetch_replay_exec_wrapper.sh"
+          cat > "$EXEC_WRAPPER" <<WRAPPER
+          #!/bin/bash
+          # Generated by compiler-tests.yml — do not edit.
+          export LD_LIBRARY_PATH="$NIOBIUM_COMPILER_ROOT/build"
+          exec "$COMPILER_BIN" "\$@"
+          WRAPPER
+          chmod +x "$EXEC_WRAPPER"
+
+          # PATH carries build/ so the compiler's secondary replay finds the
+          # `replay` helper by bare name.
+          LD_LIBRARY_PATH="$OPENFHE_LIB:$NIOBIUM_COMPILER_ROOT/build" \
+            PATH="$NIOBIUM_COMPILER_ROOT/build:$PATH" \
+            "$SERVER_BIN" --port "$PORT" --bind 127.0.0.1 --exec "$EXEC_WRAPPER" \
+            >"$RUNNER_TEMP/fhetch_server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/fhetch_server.pid"
+
+          ready=0
+          for i in $(seq 1 50); do
+            if curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then ready=1; break; fi
+            kill -0 "$(cat "$RUNNER_TEMP/fhetch_server.pid")" 2>/dev/null || { echo "::error::server exited before healthz"; exit 1; }
+            sleep 0.2
+          done
+          [ "$ready" = "1" ] || { echo "::error::server did not become healthy"; exit 1; }
+
+      # Measure peak RAM so the runner can be downsized after the first runs.
+      - name: Start memory monitor (background)
+        run: |
+          ( while true; do date -u +"%H:%M:%S"; free -h; echo "---"; sleep 1; done > "$RUNNER_TEMP/memlog.txt" ) &
+          echo $! > "$RUNNER_TEMP/memmon.pid"
+
+      # FHE_SIM, not FUNC_SIM_HW: FBS found FUNC_SIM_HW broken in SDK
+      # DIST_BUILD builds (Montgomery mismatch -> CKKS decode failure). Revisit
+      # when niobium-compiler fixes it. The harness checks the decrypted score
+      # against the cleartext reference and exits non-zero on a mismatch.
+      - name: E2E toy — exact + soundex over transport (PASS/FAIL only, compiler output suppressed)
+        run: |
+          set +x
+          export NBCC_FHETCH_SERVER="http://127.0.0.1:$PORT"
+          rc=0
+          for mode in exact soundex; do
+            if python3 harness/run_submission.py 0 --mode "$mode" --target FHE_SIM -O 3 --skip-build \
+                 >"$RUNNER_TEMP/e2e-$mode.log" 2>&1; then
+              echo "compiler E2E toy/$mode: PASS"
+            else
+              echo "::error::compiler E2E toy/$mode FAILED (output suppressed by policy; see private debug logs — reproduce locally)"
+              rc=1
+            fi
+          done
+          exit $rc
+
+      - name: Stop memory monitor and show log
+        if: always()
+        run: |
+          [ -f "$RUNNER_TEMP/memmon.pid" ] && kill "$(cat "$RUNNER_TEMP/memmon.pid")" 2>/dev/null || true
+          tail -200 "$RUNNER_TEMP/memlog.txt" || true
+
+      - name: Stop the transport server
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/fhetch_server.pid" ]; then
+            pid="$(cat "$RUNNER_TEMP/fhetch_server.pid")"
+            kill -TERM "$pid" 2>/dev/null || true
+            for i in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+          fi
+
+      # On failure, ship the suppressed logs to the PRIVATE debug bucket in the
+      # runner project (public-access-prevention, 14-day lifecycle, runner SA
+      # write-only). The public log shows only the gs:// pointer.
+      - name: Upload suppressed logs to private bucket (on failure)
+        if: failure()
+        run: |
+          set +x
+          BUCKET="github-runner-499901-ci-debug"
+          PREFIX="${{ github.repository }}/${{ github.run_id }}-${{ github.run_attempt }}"
+          TOKEN="$(curl -sf -H 'Metadata-Flavor: Google' \
+            'http://metadata/computeMetadata/v1/instance/service-accounts/default/token' \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')"
+          for f in e2e-exact.log e2e-soundex.log fhetch_server.log memlog.txt; do
+            [ -f "$RUNNER_TEMP/$f" ] || continue
+            obj="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$PREFIX/$f")"
+            if curl -sf -X POST \
+                 -H "Authorization: Bearer $TOKEN" -H 'Content-Type: text/plain' \
+                 --data-binary @"$RUNNER_TEMP/$f" \
+                 "https://storage.googleapis.com/upload/storage/v1/b/$BUCKET/o?uploadType=media&name=$obj" \
+                 >/dev/null; then
+              echo "uploaded $f"
+            else
+              echo "::warning::failed to upload $f"
+            fi
+          done
+          echo "Suppressed logs uploaded to private bucket (team-only read):"
+          echo "  gs://$BUCKET/$PREFIX/"
+          echo "Retrieve with:  gcloud storage cp -r \"gs://$BUCKET/$PREFIX\" ."
