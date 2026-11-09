@@ -31,6 +31,10 @@ name: compiler-tests
 
 on:
   workflow_dispatch: {}
+  # TEMPORARY — remove before merging. workflow_dispatch only works once this
+  # file is on main, so pushes to this branch run it for pre-merge testing.
+  push:
+    branches: [ci/gcp-ephemeral-compiler-tests]
 
 permissions:
   contents: read
