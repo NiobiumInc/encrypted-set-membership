@@ -125,11 +125,27 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build
 
+      # Measure peak RAM over the whole job, per phase, so the runner can be
+      # sized from data. Samples `used` (MiB) every second; each step names its
+      # phase in $RUNNER_TEMP/memphase. The build counts too: build_task.sh runs
+      # an unbounded `cmake --build -j`, which a smaller VM must also survive.
+      - name: Start memory monitor (background)
+        run: |
+          echo setup > "$RUNNER_TEMP/memphase"
+          ( while true; do
+              printf '%s %s %s\n' "$(date -u +%H:%M:%S)" "$(cat "$RUNNER_TEMP/memphase" 2>/dev/null || echo ?)" \
+                "$(free -m | awk '/^Mem:/{print $3, $2}')"
+              sleep 1
+            done > "$RUNNER_TEMP/memlog.txt" ) &
+          echo $! > "$RUNNER_TEMP/memmon.pid"
+
       - name: Build niobium-client + OpenFHE + matcher stages (release)
         # Public C++/OpenFHE output — OK to show. build_task.sh is the repo's
         # only build: client's bundled OpenFHE + libnbfhetch + transport server,
         # then the five stages and test_phonetic against that OpenFHE.
-        run: scripts/build_task.sh
+        run: |
+          echo build > "$RUNNER_TEMP/memphase"
+          scripts/build_task.sh
 
       - name: Unit tests (phonetic — no FHE, no compiler)
         run: ctest --test-dir build --output-on-failure
@@ -189,12 +205,6 @@ jobs:
           done
           [ "$ready" = "1" ] || { echo "::error::server did not become healthy"; exit 1; }
 
-      # Measure peak RAM so the runner can be downsized after the first runs.
-      - name: Start memory monitor (background)
-        run: |
-          ( while true; do date -u +"%H:%M:%S"; free -h; echo "---"; sleep 1; done > "$RUNNER_TEMP/memlog.txt" ) &
-          echo $! > "$RUNNER_TEMP/memmon.pid"
-
       # FHE_SIM, not FUNC_SIM_HW: FBS found FUNC_SIM_HW broken in SDK
       # DIST_BUILD builds (Montgomery mismatch -> CKKS decode failure). Revisit
       # when niobium-compiler fixes it. The harness checks the decrypted score
@@ -202,6 +212,7 @@ jobs:
       - name: E2E toy — exact + soundex over transport (PASS/FAIL only, compiler output suppressed)
         run: |
           set +x
+          echo e2e > "$RUNNER_TEMP/memphase"
           export NBCC_FHETCH_SERVER="http://127.0.0.1:$PORT"
           rc=0
           for mode in exact soundex; do
@@ -215,11 +226,23 @@ jobs:
           done
           exit $rc
 
-      - name: Stop memory monitor and show log
+      - name: Stop memory monitor and report peak
         if: always()
         run: |
           [ -f "$RUNNER_TEMP/memmon.pid" ] && kill "$(cat "$RUNNER_TEMP/memmon.pid")" 2>/dev/null || true
-          tail -200 "$RUNNER_TEMP/memlog.txt" || true
+          LOG="$RUNNER_TEMP/memlog.txt"
+          [ -s "$LOG" ] || { echo "no memory samples"; exit 0; }
+          # Line format: HH:MM:SS <phase> <used MiB> <total MiB>
+          awk '
+            { n[$2]++; if ($3 > peak[$2]) { peak[$2] = $3; at[$2] = $1 }
+              if ($3 > all) { all = $3; allat = $1; allph = $2 }; total = $4 }
+            END {
+              printf "VM total: %.1f GiB, %d samples\n", total/1024, NR
+              for (p in n) printf "peak used [%s]: %.1f GiB at %s (%d samples)\n", p, peak[p]/1024, at[p], n[p]
+              printf "PEAK USED: %.1f GiB at %s (%s)\n", all/1024, allat, allph
+            }' "$LOG"
+          echo "--- last 10 samples ---"
+          tail -10 "$LOG"
 
       - name: Stop the transport server
         if: always()
