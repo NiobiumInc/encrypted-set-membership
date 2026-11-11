@@ -41,14 +41,11 @@ concurrency:
 jobs:
   compiler-tests:
     name: Build, unit tests, E2E replay (self-hosted, GCP)
-    # Size, measured on n2-highmem-16 (2026-11-09, run 42651925157): peak used
-    # 18.0 GiB in the build (parallel OpenFHE compile), 12.7 GiB in the E2E;
-    # build 6.4 min, E2E 1.7 min. n2-standard-16 keeps the 16 vCPUs (same build
-    # time) with 64 GB, ~3.5x the peak. The memory monitor below reports the
-    # peak per phase on every run: re-check it when the build or tiers change.
+    # n2-standard-16: sized from measured peak memory (the parallel build is
+    # the peak, not the E2E). Re-measure when the build or the tiers change.
     # The "run-<run_id>" label is REQUIRED (run-scoped routing).
     runs-on: [self-hosted, Linux, X64, gcp-ephemeral, n2-standard-16, "run-${{ github.run_id }}"]
-    timeout-minutes: 30   # measured job ~9 min; a hang must not hold the VM
+    timeout-minutes: 30   # a hang must not hold the VM
     env:
       SDK: /mnt/niobium-sdk/sdk   # mounted RO at boot by runner-startup.sh
       PORT: "9443"
@@ -123,27 +120,11 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build
 
-      # Measure peak RAM over the whole job, per phase, so the runner can be
-      # sized from data. Samples `used` (MiB) every second; each step names its
-      # phase in $RUNNER_TEMP/memphase. The build counts too: build_task.sh runs
-      # an unbounded `cmake --build -j`, which a smaller VM must also survive.
-      - name: Start memory monitor (background)
-        run: |
-          echo setup > "$RUNNER_TEMP/memphase"
-          ( while true; do
-              printf '%s %s %s\n' "$(date -u +%H:%M:%S)" "$(cat "$RUNNER_TEMP/memphase" 2>/dev/null || echo ?)" \
-                "$(free -m | awk '/^Mem:/{print $3, $2}')"
-              sleep 1
-            done > "$RUNNER_TEMP/memlog.txt" ) &
-          echo $! > "$RUNNER_TEMP/memmon.pid"
-
       - name: Build niobium-client + OpenFHE + matcher stages (release)
         # Public C++/OpenFHE output — OK to show. build_task.sh is the repo's
         # only build: client's bundled OpenFHE + libnbfhetch + transport server,
         # then the five stages and test_phonetic against that OpenFHE.
-        run: |
-          echo build > "$RUNNER_TEMP/memphase"
-          scripts/build_task.sh
+        run: scripts/build_task.sh
 
       - name: Unit tests (phonetic — no FHE, no compiler)
         run: ctest --test-dir build --output-on-failure
@@ -210,7 +191,6 @@ jobs:
       - name: E2E toy — exact + soundex over transport (PASS/FAIL only, compiler output suppressed)
         run: |
           set +x
-          echo e2e > "$RUNNER_TEMP/memphase"
           export NBCC_FHETCH_SERVER="http://127.0.0.1:$PORT"
           rc=0
           for mode in exact soundex; do
@@ -223,24 +203,6 @@ jobs:
             fi
           done
           exit $rc
-
-      - name: Stop memory monitor and report peak
-        if: always()
-        run: |
-          [ -f "$RUNNER_TEMP/memmon.pid" ] && kill "$(cat "$RUNNER_TEMP/memmon.pid")" 2>/dev/null || true
-          LOG="$RUNNER_TEMP/memlog.txt"
-          [ -s "$LOG" ] || { echo "no memory samples"; exit 0; }
-          # Line format: HH:MM:SS <phase> <used MiB> <total MiB>
-          awk '
-            { n[$2]++; if ($3 > peak[$2]) { peak[$2] = $3; at[$2] = $1 }
-              if ($3 > all) { all = $3; allat = $1; allph = $2 }; total = $4 }
-            END {
-              printf "VM total: %.1f GiB, %d samples\n", total/1024, NR
-              for (p in n) printf "peak used [%s]: %.1f GiB at %s (%d samples)\n", p, peak[p]/1024, at[p], n[p]
-              printf "PEAK USED: %.1f GiB at %s (%s)\n", all/1024, allat, allph
-            }' "$LOG"
-          echo "--- last 10 samples ---"
-          tail -10 "$LOG"
 
       - name: Stop the transport server
         if: always()
@@ -264,7 +226,7 @@ jobs:
           TOKEN="$(curl -sf -H 'Metadata-Flavor: Google' \
             'http://metadata/computeMetadata/v1/instance/service-accounts/default/token' \
             | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')"
-          for f in e2e-exact.log e2e-soundex.log fhetch_server.log memlog.txt; do
+          for f in e2e-exact.log e2e-soundex.log fhetch_server.log; do
             [ -f "$RUNNER_TEMP/$f" ] || continue
             obj="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$PREFIX/$f")"
             if curl -sf -X POST \
