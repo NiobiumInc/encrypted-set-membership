@@ -105,10 +105,12 @@ jobs:
           sudo mount --bind "$SDKDIR" "$SDK"
           [ "$(stat -c %d:%i "$SDK")" = "$(stat -c %d:%i "$SDKDIR")" ] \
             || { echo "::error::pin did not take: $SDK is not $SDKDIR after the bind mount"; exit 1; }
-          BUNDLE_VERSION="$(cat "$SDK/VERSION" 2>/dev/null || echo n/a)"
-          grep -q "${TAG##*-}" <<< "$BUNDLE_VERSION" \
-            || echo "::warning::bundle VERSION '$BUNDLE_VERSION' does not mention the tag's sha7 (${TAG##*-})"
-          echo "pinned branch SDK: $TAG over $SDK (bundle VERSION: $BUNDLE_VERSION)"
+          # Bundle-to-tag binding, warning-level. The VERSION value is compiler
+          # output: checked here, never printed (header rule). The tag is fine
+          # to print — it is already public in the committed .sdk-pin.
+          grep -q "${TAG##*-}" "$SDK/VERSION" 2>/dev/null \
+            || echo "::warning::bundle VERSION does not mention the tag's sha7 (${TAG##*-})"
+          echo "pinned branch SDK: $TAG over $SDK"
 
       - name: Verify SDK is mounted (no version printed)
         run: |
